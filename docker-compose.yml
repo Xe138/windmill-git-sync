@@ -1,0 +1,25 @@
+services:
+  # ... existing Windmill services (windmill_server, windmill_worker, postgres, etc.) ...
+
+  windmill-git-sync:
+    build: .
+    container_name: windmill-git-sync
+    expose:
+      - "8080"
+    volumes:
+      - ${WORKSPACE_VOLUME}:/workspace
+    environment:
+      # Windmill connection
+      - WINDMILL_BASE_URL=http://windmill_server:8000
+      - WINDMILL_TOKEN=${WINDMILL_TOKEN}
+      - WINDMILL_WORKSPACE=${WINDMILL_WORKSPACE:-default}
+
+      # Git configuration
+      - GIT_REMOTE_URL=${GIT_REMOTE_URL}
+      - GIT_TOKEN=${GIT_TOKEN}
+      - GIT_BRANCH=${GIT_BRANCH:-main}
+      - GIT_USER_NAME=${GIT_USER_NAME:-Windmill Git Sync}
+      - GIT_USER_EMAIL=${GIT_USER_EMAIL:-windmill@example.com}
+    restart: unless-stopped
+    depends_on:
+      - windmill_server
