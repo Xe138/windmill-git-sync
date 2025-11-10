@@ -6,13 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a containerized service for synchronizing Windmill workspaces to Git repositories. The service provides a Flask webhook server that Windmill can call to trigger automated backups of workspace content to a remote Git repository.
 
+**Key Security Design**: Secrets (Windmill tokens, Git tokens) are NOT stored in environment variables or docker-compose files. Instead, they are passed dynamically via JSON payload in API requests from Windmill, which manages them in its own secret store.
+
 ### Architecture
 
 The system consists of three main components:
 
-1. **Flask Web Server** (`app/server.py`): Lightweight HTTP server that exposes webhook endpoints for triggering syncs and health checks. Only accessible within the Docker network (not exposed to host).
+1. **Flask Web Server** (`app/server.py`): Lightweight HTTP server that exposes webhook endpoints for triggering syncs and health checks. Parses JSON payloads containing secrets and configuration for each sync request. Only accessible within the Docker network (not exposed to host).
 
 2. **Sync Engine** (`app/sync.py`): Core logic that orchestrates the sync process:
+   - Accepts configuration as function parameters (not from environment variables)
    - Pulls workspace content from Windmill using the `wmill` CLI
    - Manages Git repository state (init on first run, subsequent updates)
    - Commits changes and pushes to remote Git repository with PAT authentication
@@ -22,12 +25,14 @@ The system consists of three main components:
 
 ### Key Design Decisions
 
+- **API-based configuration**: Secrets and sync parameters are passed via JSON payload in each API request. Only infrastructure settings (WINDMILL_BASE_URL, volume names) are in environment variables.
+- **Security-first**: No secrets in `.env` files or docker-compose.yml. All sensitive data managed by Windmill and passed per-request.
+- **Flexible**: Same container can sync different workspaces to different repositories without reconfiguration or restart.
 - **Integrated with Windmill docker-compose**: This service is designed to be added as an additional service in your existing Windmill docker-compose file. It shares the same Docker network and can reference Windmill services directly (e.g., `windmill_server`).
 - **Network isolation**: Service uses `expose` instead of `ports` - accessible only within Docker network, not from host machine. No authentication needed since it's isolated.
-- **Webhook-only triggering**: Sync happens only when explicitly triggered via HTTP POST to `/sync`. This gives Windmill full control over backup timing via scheduled flows.
+- **Webhook-only triggering**: Sync happens only when explicitly triggered via HTTP POST to `/sync` with JSON payload. This gives Windmill full control over backup timing and configuration via scheduled flows.
 - **HTTPS + Personal Access Token**: Git authentication uses PAT injected into HTTPS URL (format: `https://TOKEN@github.com/user/repo.git`). No SSH key management required.
 - **Stateless operation**: Each sync is independent. The container can be restarted without losing state (workspace data persists in Docker volume).
-- **Single workspace focus**: Designed to sync one Windmill workspace per container instance. For multiple workspaces, run multiple containers with different configurations.
 
 ## Common Development Commands
 
@@ -50,11 +55,21 @@ docker-compose down
 ### Testing
 
 ```bash
-# Test the sync manually (from inside container)
+# Test the sync manually (from inside container) - requires env vars for testing
 docker-compose exec windmill-git-sync python app/sync.py
 
-# Test webhook endpoint (from another container in the network)
-docker-compose exec windmill_server curl -X POST http://windmill-git-sync:8080/sync
+# Test webhook endpoint with JSON payload (from another container in the network)
+docker-compose exec windmill_server curl -X POST http://windmill-git-sync:8080/sync \
+  -H "Content-Type: application/json" \
+  -d '{
+    "windmill_token": "your-token",
+    "git_remote_url": "https://github.com/user/repo.git",
+    "git_token": "your-git-token",
+    "workspace": "admins",
+    "git_branch": "main",
+    "git_user_name": "Windmill Git Sync",
+    "git_user_email": "windmill@example.com"
+  }'
 
 # Health check (from another container in the network)
 docker-compose exec windmill_server curl http://windmill-git-sync:8080/health
@@ -79,12 +94,29 @@ docker-compose exec windmill-git-sync ls -la /workspace
 
 ## Environment Configuration
 
-All configuration is done via `.env` file (copy from `.env.example`). Required variables:
+Configuration is split between infrastructure (`.env` file) and secrets (API payload):
 
-- `WINDMILL_TOKEN`: API token from Windmill for workspace access
-- `WORKSPACE_VOLUME`: External Docker volume name for persistent workspace storage (default: `windmill-workspace-data`)
-- `GIT_REMOTE_URL`: HTTPS URL of Git repository (e.g., `https://github.com/user/repo.git`)
-- `GIT_TOKEN`: Personal Access Token with repo write permissions
+### Infrastructure Configuration (.env file)
+
+**Integration Approach:** This service's configuration should be **added to your existing Windmill `.env` file**, not maintained as a separate file. The `.env.example` file shows what to add.
+
+Required in your Windmill `.env` file:
+- `WINDMILL_DATA_PATH`: Path to Windmill data directory (should already exist in your Windmill setup)
+- `WINDMILL_BASE_URL`: URL of Windmill instance (default: `http://windmill_server:8000`)
+
+The docker-compose service uses `${WINDMILL_DATA_PATH}/workspace` as the volume mount path for workspace data.
+
+### Secrets Configuration (API Payload)
+
+Secrets are passed in the JSON body of POST requests to `/sync`:
+
+- `windmill_token` (required): Windmill API token for workspace access
+- `git_remote_url` (required): HTTPS URL of Git repository (e.g., `https://github.com/user/repo.git`)
+- `git_token` (required): Personal Access Token with repo write permissions
+- `workspace` (optional): Workspace name to sync (default: `admins`)
+- `git_branch` (optional): Branch to push to (default: `main`)
+- `git_user_name` (optional): Git commit author name (default: `Windmill Git Sync`)
+- `git_user_email` (optional): Git commit author email (default: `windmill@example.com`)
 
 ### Docker Compose Integration
 
@@ -92,7 +124,9 @@ The `docker-compose.yml` file contains a service definition meant to be **added 
 - Does not declare its own network (uses the implicit network from the parent compose file)
 - Assumes a Windmill service named `windmill_server` exists in the same compose file
 - Uses `depends_on: windmill_server` to ensure proper startup order
-- Requires an external Docker volume specified in `WORKSPACE_VOLUME` env var (created via `docker volume create windmill-workspace-data`)
+- Mounts workspace directory from existing Windmill data path: `${WINDMILL_DATA_PATH}/workspace:/workspace`
+- Only exposes infrastructure config as environment variables (no secrets)
+- Reads from the same `.env` file as your Windmill services
 
 ## Code Structure
 
@@ -104,12 +138,17 @@ app/
 
 ### Important Functions
 
-- `sync.sync_windmill_to_git()`: Main entry point for sync operation. Returns dict with `success` bool and `message` string.
-- `sync.validate_config()`: Checks required env vars are set. Raises ValueError if missing.
-- `sync.run_wmill_sync()`: Executes `wmill sync pull` command with proper environment variables.
-- `sync.commit_and_push_changes()`: Stages all changes, commits with automated message, and pushes to remote.
+- `sync.sync_windmill_to_git(config: Dict[str, Any])`: Main entry point for sync operation. Accepts config dictionary with secrets and parameters. Returns dict with `success` bool and `message` string.
+- `sync.validate_config(config: Dict[str, Any])`: Validates required fields are present in config dict. Raises ValueError if missing required fields (windmill_token, git_remote_url, git_token).
+- `sync.run_wmill_sync(config: Dict[str, Any])`: Executes `wmill sync pull` command using config parameters, not environment variables.
+- `sync.commit_and_push_changes(repo: Repo, config: Dict[str, Any])`: Stages all changes, commits with automated message, and pushes to remote using config parameters.
 
 ### Error Handling
+
+The server validates JSON payloads and returns appropriate HTTP status codes:
+- **400 Bad Request**: Missing required fields or invalid JSON
+- **200 OK**: Sync succeeded (returns success dict)
+- **500 Internal Server Error**: Sync failed (returns error dict)
 
 The sync engine uses a try/except pattern that always returns a result dict, never raises to the web server. This ensures webhook requests always get a proper HTTP response with error details in JSON.
 
@@ -118,7 +157,7 @@ The sync engine uses a try/except pattern that always returns a result dict, nev
 When making changes to this codebase:
 
 1. Changes are tracked in the project's own Git repository (not the Windmill workspace backup repo)
-2. The service manages commits to the **remote backup repository** specified in `GIT_REMOTE_URL`
+2. The service manages commits to the **remote backup repository** specified in the API payload's `git_remote_url`
 3. Commits to the backup repo use the automated format: "Automated Windmill workspace backup - {workspace_name}"
 
 ## Network Architecture

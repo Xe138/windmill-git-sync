@@ -6,35 +6,31 @@ import os
 import subprocess
 import logging
 from pathlib import Path
+from typing import Dict, Any
 from git import Repo, GitCommandError
 
 logger = logging.getLogger(__name__)
 
-# Configuration from environment variables
+# Configuration from environment variables (infrastructure only)
 WORKSPACE_DIR = Path('/workspace')
-WINDMILL_BASE_URL = os.getenv('WINDMILL_BASE_URL', 'http://windmill:8000')
-WINDMILL_TOKEN = os.getenv('WINDMILL_TOKEN', '')
-WINDMILL_WORKSPACE = os.getenv('WINDMILL_WORKSPACE', 'default')
-GIT_REMOTE_URL = os.getenv('GIT_REMOTE_URL', '')
-GIT_TOKEN = os.getenv('GIT_TOKEN', '')
-GIT_BRANCH = os.getenv('GIT_BRANCH', 'main')
-GIT_USER_NAME = os.getenv('GIT_USER_NAME', 'Windmill Git Sync')
-GIT_USER_EMAIL = os.getenv('GIT_USER_EMAIL', 'windmill@example.com')
+WINDMILL_BASE_URL = os.getenv('WINDMILL_BASE_URL', 'http://windmill_server:8000')
 
 
-def validate_config():
-    """Validate required configuration is present."""
-    missing = []
+def validate_config(config: Dict[str, Any]) -> None:
+    """
+    Validate required configuration is present in the provided config dict.
 
-    if not WINDMILL_TOKEN:
-        missing.append('WINDMILL_TOKEN')
-    if not GIT_REMOTE_URL:
-        missing.append('GIT_REMOTE_URL')
-    if not GIT_TOKEN:
-        missing.append('GIT_TOKEN')
+    Args:
+        config: Configuration dictionary with sync parameters
+
+    Raises:
+        ValueError: If required fields are missing
+    """
+    required_fields = ['windmill_token', 'git_remote_url', 'git_token']
+    missing = [field for field in required_fields if not config.get(field)]
 
     if missing:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+        raise ValueError(f"Missing required fields: {', '.join(missing)}")
 
 
 def get_authenticated_url(url: str, token: str) -> str:
@@ -45,14 +41,28 @@ def get_authenticated_url(url: str, token: str) -> str:
     return url
 
 
-def run_wmill_sync():
-    """Run wmill sync to pull workspace from Windmill."""
-    logger.info(f"Syncing Windmill workspace '{WINDMILL_WORKSPACE}' from {WINDMILL_BASE_URL}")
+def run_wmill_sync(config: Dict[str, Any]) -> bool:
+    """
+    Run wmill sync to pull workspace from Windmill.
+
+    Args:
+        config: Configuration dictionary containing windmill_token and workspace
+
+    Returns:
+        bool: True if sync was successful
+
+    Raises:
+        RuntimeError: If wmill sync command fails
+    """
+    workspace = config.get('workspace', 'admins')
+    windmill_token = config['windmill_token']
+
+    logger.info(f"Syncing Windmill workspace '{workspace}' from {WINDMILL_BASE_URL}")
 
     env = os.environ.copy()
     env['WM_BASE_URL'] = WINDMILL_BASE_URL
-    env['WM_TOKEN'] = WINDMILL_TOKEN
-    env['WM_WORKSPACE'] = WINDMILL_WORKSPACE
+    env['WM_TOKEN'] = windmill_token
+    env['WM_WORKSPACE'] = workspace
 
     try:
         # Run wmill sync in the workspace directory
@@ -75,8 +85,19 @@ def run_wmill_sync():
         raise RuntimeError(f"Failed to sync from Windmill: {e.stderr}")
 
 
-def init_or_update_git_repo():
-    """Initialize Git repository or open existing one."""
+def init_or_update_git_repo(config: Dict[str, Any]) -> Repo:
+    """
+    Initialize Git repository or open existing one.
+
+    Args:
+        config: Configuration dictionary containing optional git_user_name and git_user_email
+
+    Returns:
+        Repo: GitPython repository object
+    """
+    git_user_name = config.get('git_user_name', 'Windmill Git Sync')
+    git_user_email = config.get('git_user_email', 'windmill@example.com')
+
     git_dir = WORKSPACE_DIR / '.git'
 
     if git_dir.exists():
@@ -87,14 +108,31 @@ def init_or_update_git_repo():
         repo = Repo.init(WORKSPACE_DIR)
 
         # Configure user
-        repo.config_writer().set_value("user", "name", GIT_USER_NAME).release()
-        repo.config_writer().set_value("user", "email", GIT_USER_EMAIL).release()
+        repo.config_writer().set_value("user", "name", git_user_name).release()
+        repo.config_writer().set_value("user", "email", git_user_email).release()
 
     return repo
 
 
-def commit_and_push_changes(repo: Repo):
-    """Commit changes and push to remote Git repository."""
+def commit_and_push_changes(repo: Repo, config: Dict[str, Any]) -> bool:
+    """
+    Commit changes and push to remote Git repository.
+
+    Args:
+        repo: GitPython Repo object
+        config: Configuration dictionary containing git_remote_url, git_token, git_branch, and workspace
+
+    Returns:
+        bool: True if changes were committed and pushed, False if no changes
+
+    Raises:
+        RuntimeError: If git push fails
+    """
+    workspace = config.get('workspace', 'admins')
+    git_remote_url = config['git_remote_url']
+    git_token = config['git_token']
+    git_branch = config.get('git_branch', 'main')
+
     # Check if there are any changes
     if not repo.is_dirty(untracked_files=True):
         logger.info("No changes to commit")
@@ -104,12 +142,12 @@ def commit_and_push_changes(repo: Repo):
     repo.git.add(A=True)
 
     # Create commit
-    commit_message = f"Automated Windmill workspace backup - {WINDMILL_WORKSPACE}"
+    commit_message = f"Automated Windmill workspace backup - {workspace}"
     repo.index.commit(commit_message)
     logger.info(f"Created commit: {commit_message}")
 
     # Configure remote with authentication
-    authenticated_url = get_authenticated_url(GIT_REMOTE_URL, GIT_TOKEN)
+    authenticated_url = get_authenticated_url(git_remote_url, git_token)
 
     try:
         # Check if remote exists
@@ -120,8 +158,8 @@ def commit_and_push_changes(repo: Repo):
             origin = repo.create_remote('origin', authenticated_url)
 
         # Push to remote
-        logger.info(f"Pushing to {GIT_REMOTE_URL} (branch: {GIT_BRANCH})")
-        origin.push(refspec=f'HEAD:{GIT_BRANCH}', force=False)
+        logger.info(f"Pushing to {git_remote_url} (branch: {git_branch})")
+        origin.push(refspec=f'HEAD:{git_branch}', force=False)
         logger.info("Push completed successfully")
 
         return True
@@ -131,28 +169,40 @@ def commit_and_push_changes(repo: Repo):
         raise RuntimeError(f"Failed to push to Git remote: {str(e)}")
 
 
-def sync_windmill_to_git():
+def sync_windmill_to_git(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Main sync function: pulls from Windmill, commits, and pushes to Git.
+
+    Args:
+        config: Configuration dictionary with the following keys:
+            - windmill_token (required): Windmill API token
+            - git_remote_url (required): Git repository URL
+            - git_token (required): Git authentication token
+            - workspace (optional): Windmill workspace name (default: "admins")
+            - git_branch (optional): Git branch to push to (default: "main")
+            - git_user_name (optional): Git commit author name (default: "Windmill Git Sync")
+            - git_user_email (optional): Git commit author email (default: "windmill@example.com")
 
     Returns:
         dict: Result with 'success' boolean and 'message' string
     """
     try:
         # Validate configuration
-        validate_config()
+        validate_config(config)
+
+        workspace = config.get('workspace', 'admins')
 
         # Pull from Windmill
-        run_wmill_sync()
+        run_wmill_sync(config)
 
         # Initialize/update Git repo
-        repo = init_or_update_git_repo()
+        repo = init_or_update_git_repo(config)
 
         # Commit and push changes
-        has_changes = commit_and_push_changes(repo)
+        has_changes = commit_and_push_changes(repo, config)
 
         if has_changes:
-            message = f"Successfully synced workspace '{WINDMILL_WORKSPACE}' to Git"
+            message = f"Successfully synced workspace '{workspace}' to Git"
         else:
             message = "Sync completed - no changes to commit"
 
@@ -170,7 +220,17 @@ def sync_windmill_to_git():
 
 
 if __name__ == '__main__':
-    # Allow running sync directly for testing
+    # Allow running sync directly for testing with environment variables
     logging.basicConfig(level=logging.INFO)
-    result = sync_windmill_to_git()
+
+    # For testing: load config from environment variables
+    test_config = {
+        'windmill_token': os.getenv('WINDMILL_TOKEN', ''),
+        'git_remote_url': os.getenv('GIT_REMOTE_URL', ''),
+        'git_token': os.getenv('GIT_TOKEN', ''),
+        'workspace': os.getenv('WINDMILL_WORKSPACE', 'admins'),
+        'git_branch': os.getenv('GIT_BRANCH', 'main')
+    }
+
+    result = sync_windmill_to_git(test_config)
     print(result)

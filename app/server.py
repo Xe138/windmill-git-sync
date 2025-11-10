@@ -4,7 +4,7 @@ Flask server for receiving webhook triggers from Windmill to sync workspace to G
 Internal service - not exposed outside Docker network.
 """
 import logging
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from sync import sync_windmill_to_git
 
 # Configure logging
@@ -28,11 +28,54 @@ def trigger_sync():
     """
     Trigger a sync from Windmill workspace to Git repository.
     This endpoint is only accessible within the Docker network.
+
+    Expected JSON payload:
+    {
+        "windmill_token": "string (required)",
+        "git_remote_url": "string (required)",
+        "git_token": "string (required)",
+        "workspace": "string (optional, default: 'admins')",
+        "git_branch": "string (optional, default: 'main')",
+        "git_user_name": "string (optional, default: 'Windmill Git Sync')",
+        "git_user_email": "string (optional, default: 'windmill@example.com')"
+    }
     """
     logger.info("Sync triggered via webhook")
 
+    # Parse JSON payload
     try:
-        result = sync_windmill_to_git()
+        config = request.get_json(force=True)
+        if not config:
+            return jsonify({
+                'success': False,
+                'message': 'Request body must be valid JSON'
+            }), 400
+    except Exception as e:
+        logger.error(f"Failed to parse JSON payload: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': f'Invalid JSON payload: {str(e)}'
+        }), 400
+
+    # Validate required fields
+    required_fields = ['windmill_token', 'git_remote_url', 'git_token']
+    missing_fields = [field for field in required_fields if not config.get(field)]
+
+    if missing_fields:
+        error_message = f"Missing required fields: {', '.join(missing_fields)}"
+        logger.error(error_message)
+        return jsonify({
+            'success': False,
+            'message': error_message
+        }), 400
+
+    # Log configuration (without exposing secrets)
+    workspace = config.get('workspace', 'admins')
+    git_branch = config.get('git_branch', 'main')
+    logger.info(f"Sync configuration - workspace: {workspace}, branch: {git_branch}")
+
+    try:
+        result = sync_windmill_to_git(config)
 
         if result['success']:
             logger.info(f"Sync completed successfully: {result['message']}")
