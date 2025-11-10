@@ -86,9 +86,115 @@ def run_wmill_sync(config: Dict[str, Any]) -> bool:
         raise RuntimeError(f"Failed to sync from Windmill: {e.stderr}")
 
 
+def is_workspace_empty() -> bool:
+    """
+    Check if workspace directory is empty or not initialized as a git repo.
+
+    Returns:
+        bool: True if directory is empty or not a git repository
+    """
+    git_dir = WORKSPACE_DIR / '.git'
+
+    # Check if .git directory exists
+    if not git_dir.exists():
+        # Check if workspace is completely empty or has no meaningful content
+        workspace_contents = list(WORKSPACE_DIR.iterdir())
+        return len(workspace_contents) == 0
+
+    return False
+
+
+def clone_remote_repository(config: Dict[str, Any]) -> Repo:
+    """
+    Clone remote repository to workspace directory.
+
+    Args:
+        config: Configuration dictionary containing git_remote_url, git_token, git_branch
+
+    Returns:
+        Repo: GitPython repository object
+
+    Raises:
+        RuntimeError: If clone fails
+    """
+    git_remote_url = config['git_remote_url']
+    git_token = config['git_token']
+    git_branch = config.get('git_branch', 'main')
+    git_user_name = config.get('git_user_name', 'Windmill Git Sync')
+    git_user_email = config.get('git_user_email', 'windmill@example.com')
+
+    authenticated_url = get_authenticated_url(git_remote_url, git_token)
+
+    logger.info(f"Cloning remote repository from {git_remote_url}")
+
+    try:
+        # Clone the repository
+        repo = Repo.clone_from(authenticated_url, WORKSPACE_DIR)
+
+        # Configure user
+        repo.config_writer().set_value("user", "name", git_user_name).release()
+        repo.config_writer().set_value("user", "email", git_user_email).release()
+
+        # Check if the specified branch exists
+        try:
+            repo.git.checkout(git_branch)
+            logger.info(f"Checked out existing branch '{git_branch}'")
+        except GitCommandError:
+            # Branch doesn't exist, create it as orphan
+            logger.info(f"Branch '{git_branch}' doesn't exist, creating new branch")
+            repo.git.checkout('--orphan', git_branch)
+            # Remove all files from staging (orphan branch starts with staged files)
+            try:
+                repo.git.rm('-rf', '.')
+            except GitCommandError:
+                # If rm fails (no files to remove), that's fine
+                pass
+
+        logger.info("Repository cloned successfully")
+        return repo
+
+    except GitCommandError as e:
+        logger.error(f"Failed to clone repository: {str(e)}")
+        raise RuntimeError(f"Failed to clone remote repository: {str(e)}")
+
+
+def sync_local_with_remote(repo: Repo, config: Dict[str, Any]) -> None:
+    """
+    Sync local repository with remote (fetch and hard reset).
+
+    Args:
+        repo: GitPython Repo object
+        config: Configuration dictionary containing git_branch
+
+    Raises:
+        RuntimeError: If sync fails
+    """
+    git_branch = config.get('git_branch', 'main')
+
+    logger.info(f"Syncing local repository with remote branch '{git_branch}'")
+
+    try:
+        # Fetch from remote
+        origin = repo.remote('origin')
+        origin.fetch()
+        logger.info("Fetched from remote")
+
+        # Reset local branch to match remote
+        try:
+            repo.git.reset('--hard', f'origin/{git_branch}')
+            logger.info(f"Reset local branch to match origin/{git_branch}")
+        except GitCommandError as e:
+            # Branch might not exist on remote yet, which is fine
+            logger.info(f"Branch '{git_branch}' doesn't exist on remote yet, will be created on push")
+
+    except GitCommandError as e:
+        logger.error(f"Failed to sync with remote: {str(e)}")
+        raise RuntimeError(f"Failed to sync local repository with remote: {str(e)}")
+
+
 def init_or_update_git_repo(config: Dict[str, Any]) -> Repo:
     """
-    Initialize Git repository or open existing one.
+    Initialize Git repository, clone from remote if needed, or open existing one.
 
     Args:
         config: Configuration dictionary containing optional git_user_name and git_user_email
@@ -101,10 +207,23 @@ def init_or_update_git_repo(config: Dict[str, Any]) -> Repo:
 
     git_dir = WORKSPACE_DIR / '.git'
 
+    # Check if workspace is empty/uninitialized
+    if is_workspace_empty():
+        # Try to clone from remote
+        logger.info("Workspace is empty, attempting to clone from remote")
+        return clone_remote_repository(config)
+
+    # Repository already exists
     if git_dir.exists():
         logger.info("Opening existing Git repository")
         repo = Repo(WORKSPACE_DIR)
+
+        # Sync with remote before continuing
+        sync_local_with_remote(repo, config)
+
+        return repo
     else:
+        # Workspace has files but no git repo - initialize new repo
         logger.info("Initializing new Git repository")
         repo = Repo.init(WORKSPACE_DIR)
 
@@ -112,7 +231,7 @@ def init_or_update_git_repo(config: Dict[str, Any]) -> Repo:
         repo.config_writer().set_value("user", "name", git_user_name).release()
         repo.config_writer().set_value("user", "email", git_user_email).release()
 
-    return repo
+        return repo
 
 
 def commit_and_push_changes(repo: Repo, config: Dict[str, Any]) -> bool:
