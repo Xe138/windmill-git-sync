@@ -3,6 +3,7 @@
 Core sync logic for pulling Windmill workspace and pushing to Git.
 """
 import os
+import shutil
 import subprocess
 import logging
 from pathlib import Path
@@ -223,15 +224,18 @@ def init_or_update_git_repo(config: Dict[str, Any]) -> Repo:
 
         return repo
     else:
-        # Workspace has files but no git repo - initialize new repo
-        logger.info("Initializing new Git repository")
-        repo = Repo.init(WORKSPACE_DIR)
+        # Workspace has files but no git repo - delete contents and clone
+        logger.info("Workspace has files but no git repository, cleaning and cloning from remote")
 
-        # Configure user
-        repo.config_writer().set_value("user", "name", git_user_name).release()
-        repo.config_writer().set_value("user", "email", git_user_email).release()
+        # Delete all contents in workspace
+        for item in WORKSPACE_DIR.iterdir():
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
 
-        return repo
+        logger.info("Workspace cleaned, attempting to clone from remote")
+        return clone_remote_repository(config)
 
 
 def commit_and_push_changes(repo: Repo, config: Dict[str, Any]) -> bool:
@@ -279,9 +283,21 @@ def commit_and_push_changes(repo: Repo, config: Dict[str, Any]) -> bool:
 
         # Push to remote
         logger.info(f"Pushing to {git_remote_url} (branch: {git_branch})")
-        origin.push(refspec=f'HEAD:{git_branch}', force=False)
-        logger.info("Push completed successfully")
+        push_info = origin.push(refspec=f'HEAD:{git_branch}', force=False)
 
+        # Check push results for errors
+        if push_info:
+            for info in push_info:
+                if info.flags & info.ERROR:
+                    error_msg = f"Push failed: {info.summary}"
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+                elif info.flags & info.REJECTED:
+                    error_msg = f"Push rejected (non-fast-forward): {info.summary}"
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+        logger.info("Push completed successfully")
         return True
 
     except GitCommandError as e:
@@ -312,11 +328,11 @@ def sync_windmill_to_git(config: Dict[str, Any]) -> Dict[str, Any]:
 
         workspace = config.get('workspace', 'admins')
 
-        # Pull from Windmill
-        run_wmill_sync(config)
-
-        # Initialize/update Git repo
+        # Initialize/update Git repo (must happen BEFORE wmill sync to clone if needed)
         repo = init_or_update_git_repo(config)
+
+        # Pull from Windmill (overwrites files with Windmill workspace content)
+        run_wmill_sync(config)
 
         # Commit and push changes
         has_changes = commit_and_push_changes(repo, config)
