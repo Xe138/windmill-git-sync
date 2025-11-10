@@ -59,17 +59,18 @@ def run_wmill_sync(config: Dict[str, Any]) -> bool:
 
     logger.info(f"Syncing Windmill workspace '{workspace}' from {WINDMILL_BASE_URL}")
 
-    env = os.environ.copy()
-    env['WM_BASE_URL'] = WINDMILL_BASE_URL
-    env['WM_TOKEN'] = windmill_token
-    env['WM_WORKSPACE'] = workspace
-
     try:
-        # Run wmill sync in the workspace directory
+        # Run wmill sync in the workspace directory with explicit flags
+        # Note: When using --base-url, --token and --workspace are required
         result = subprocess.run(
-            ['wmill', 'sync', 'pull', '--yes'],
+            [
+                'wmill', 'sync', 'pull',
+                '--base-url', WINDMILL_BASE_URL,
+                '--token', windmill_token,
+                '--workspace', workspace,
+                '--yes'
+            ],
             cwd=WORKSPACE_DIR,
-            env=env,
             capture_output=True,
             text=True,
             check=True
